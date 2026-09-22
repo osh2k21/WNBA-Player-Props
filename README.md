@@ -96,3 +96,25 @@ Flask image proxy at `/api/player-image/<player_id>`. The backend requests the
 official WNBA headshot using WNBA-compatible request headers and serves it to the
 browser locally. If the official CDN has no headshot for a player, the UI still
 falls back to the player's initials.
+
+
+## v6 Render-safe fallback
+
+Cloud hosts such as Render can occasionally receive an HTML challenge/block page
+from `stats.wnba.com`, even when the same WNBA Stats request works from a home PC.
+
+v6 now:
+
+1. Tries official WNBA Stats first.
+2. If the WNBA Stats player request fails, automatically loads WNBA teams and
+   rosters from ESPN.
+3. In fallback mode, player analysis uses ESPN's WNBA athlete game-log data and
+   normalizes it into the same PTS / REB / AST / FG3M format.
+4. Applies the exact same August/September L10, L5, H2H and strict pass rules.
+5. Clearly labels fallback mode in the page rather than silently changing sources.
+6. Safely handles non-JSON server responses, so an upstream HTML error page no
+   longer produces the confusing "Unexpected token '<'" browser error.
+7. Includes `render.yaml` and Gunicorn for easier Render deployment.
+
+The official WNBA Stats source remains the primary source whenever the host can
+reach it.

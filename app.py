@@ -14,6 +14,9 @@ app = Flask(__name__)
 WNBA_STATS_BASE = "https://stats.wnba.com/stats"
 LEAGUE_ID = "10"
 
+ESPN_SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba"
+ESPN_WEB_BASE = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/wnba"
+
 # Browser-like headers are important for the official WNBA/NBA stats service.
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -298,6 +301,282 @@ def player_logs(player_id: str, season: str) -> list[dict]:
     return rows
 
 
+
+def espn_get(url: str, params: dict[str, Any] | None = None, timeout: int = 20) -> dict:
+    """Fetch JSON from ESPN's public web data endpoints."""
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": HEADERS["User-Agent"],
+        "Referer": "https://www.espn.com/",
+    }
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = requests.get(url, params=params or {}, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if "json" not in content_type.lower():
+                # Some upstreams omit the JSON content type, so still try JSON,
+                # but emit a useful error when an HTML challenge page is returned.
+                text = response.text.lstrip()
+                if text.startswith("<"):
+                    raise RuntimeError("ESPN returned HTML instead of JSON.")
+            return response.json()
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(0.6 * (attempt + 1))
+    raise RuntimeError(f"ESPN fallback request failed: {last_error}")
+
+
+def _espn_team_entries(payload: dict) -> list[dict]:
+    """Extract team objects from ESPN's WNBA teams response."""
+    teams = []
+    try:
+        sports = payload.get("sports", [])
+        for sport in sports:
+            for league in sport.get("leagues", []):
+                for wrapper in league.get("teams", []):
+                    team = wrapper.get("team", wrapper)
+                    if isinstance(team, dict) and team.get("id"):
+                        teams.append(team)
+    except Exception:
+        pass
+    return teams
+
+
+def _flatten_roster_athletes(payload: dict) -> list[dict]:
+    """Handle both flat and grouped ESPN roster shapes."""
+    out = []
+    raw = payload.get("athletes", [])
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            if item.get("id") and (item.get("fullName") or item.get("displayName")):
+                out.append(item)
+                continue
+            for key in ("items", "athletes"):
+                nested = item.get(key)
+                if isinstance(nested, list):
+                    for athlete in nested:
+                        if isinstance(athlete, dict) and athlete.get("id"):
+                            out.append(athlete)
+    return out
+
+
+def espn_league_players(season: str) -> list[dict]:
+    """
+    Render-safe player-list fallback.
+
+    stats.wnba.com sometimes blocks cloud/datacenter IPs. ESPN's team + roster
+    endpoints are used only when the official WNBA Stats request cannot be used.
+    """
+    cache_key = f"espn-players:{season}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    teams_payload = espn_get(f"{ESPN_SITE_BASE}/teams", {"limit": 100})
+    team_entries = _espn_team_entries(teams_payload)
+    if not team_entries:
+        raise RuntimeError("ESPN returned no WNBA teams.")
+
+    players = []
+    seen = set()
+
+    for team in team_entries:
+        team_id = str(team.get("id", ""))
+        abbr = str(team.get("abbreviation", "")).upper()
+        if not team_id or not abbr:
+            continue
+
+        logos = team.get("logos") or []
+        logo_url = None
+        if isinstance(logos, list) and logos:
+            logo_url = logos[0].get("href")
+
+        try:
+            roster = espn_get(f"{ESPN_SITE_BASE}/teams/{team_id}/roster")
+        except Exception:
+            continue
+
+        for athlete in _flatten_roster_athletes(roster):
+            espn_id = str(athlete.get("id", ""))
+            if not espn_id:
+                continue
+            key = (espn_id, team_id)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            headshot = athlete.get("headshot")
+            photo_url = headshot.get("href") if isinstance(headshot, dict) else None
+
+            players.append(
+                {
+                    # Prefix prevents an ESPN ID from being mistaken for a WNBA Stats ID.
+                    "player_id": f"espn:{espn_id}",
+                    "provider_player_id": espn_id,
+                    "provider": "espn",
+                    "player_name": athlete.get("fullName") or athlete.get("displayName") or "",
+                    "team_id": team_id,
+                    "team": abbr,
+                    "team_logo": logo_url,
+                    "photo_url": photo_url,
+                    "season_pts": None,
+                    "season_reb": None,
+                    "season_ast": None,
+                    "season_fg3m": None,
+                    "season_min": None,
+                    "gp": None,
+                }
+            )
+
+    if not players:
+        raise RuntimeError("ESPN fallback returned no WNBA roster players.")
+
+    players.sort(key=lambda x: (x["team"], x["player_name"]))
+    _cache_set(cache_key, players)
+    return players
+
+
+def players_with_fallback(season: str) -> tuple[list[dict], str, str | None]:
+    """
+    Prefer official WNBA Stats. If the cloud host is blocked/challenged,
+    automatically fall back to ESPN for team rosters and player identifiers.
+    """
+    try:
+        official = league_players(season)
+        if official:
+            for p in official:
+                p.setdefault("provider", "wnba")
+                p.setdefault("provider_player_id", p.get("player_id"))
+                p.setdefault("team_logo", None)
+                p.setdefault("photo_url", None)
+            return official, "Official WNBA Stats", None
+        raise RuntimeError("Official WNBA Stats returned no players.")
+    except Exception as exc:
+        fallback = espn_league_players(season)
+        return (
+            fallback,
+            "ESPN fallback",
+            f"Official WNBA Stats was unavailable from this server, so the app switched to ESPN. {exc}",
+        )
+
+
+def _made_from_attempt_string(value: Any) -> float:
+    text = str(value or "").strip()
+    if "-" in text:
+        text = text.split("-", 1)[0]
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def espn_player_logs(espn_player_id: str, season: str, team_abbr: str) -> list[dict]:
+    """
+    Normalize ESPN's athlete gamelog into the same fields used by the WNBA
+    Stats analyzer: GAME_DATE, MATCHUP, MIN, PTS, REB, AST, FG3M.
+    """
+    cache_key = f"espn-gamelog:{season}:{espn_player_id}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    payload = espn_get(
+        f"{ESPN_WEB_BASE}/athletes/{espn_player_id}/gamelog",
+        {"season": season},
+    )
+
+    labels = payload.get("labels") or []
+    names = payload.get("names") or []
+    events = payload.get("events") or []
+
+    if not isinstance(events, list):
+        raise RuntimeError("ESPN gamelog did not contain an events list.")
+
+    # Stats usually map to labels after DATE / OPP / RESULT. Use semantic names
+    # when possible and label fallbacks otherwise.
+    meta_count = max(0, len(labels) - (len(events[0].get("stats", [])) if events else 0))
+    stat_labels = labels[meta_count:] if labels else []
+    stat_names = names[meta_count:] if names else []
+
+    rows = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+
+        stats = event.get("stats") or []
+        stat_map = {}
+        for i, raw in enumerate(stats):
+            if i < len(stat_labels):
+                stat_map[str(stat_labels[i]).upper()] = raw
+            if i < len(stat_names):
+                stat_map[str(stat_names[i])] = raw
+
+        opponent = event.get("opponent") or {}
+        opp_abbr = str(opponent.get("abbreviation") or "").upper()
+
+        # ESPN sometimes provides atVs/homeAway. H2H only requires opponent
+        # abbreviation to be present in MATCHUP, so use a stable representation.
+        matchup = f"{team_abbr.upper()} vs. {opp_abbr}" if opp_abbr else team_abbr.upper()
+
+        def pick(*keys, default=0):
+            for key in keys:
+                if key in stat_map and stat_map[key] not in (None, ""):
+                    return stat_map[key]
+            return default
+
+        row = {
+            "GAME_DATE": event.get("date"),
+            "MATCHUP": matchup,
+            "MIN": pick("MIN", "minutes", default=0),
+            "PTS": pick("PTS", "points", default=0),
+            "REB": pick("REB", "rebounds", default=0),
+            "AST": pick("AST", "assists", default=0),
+            "FG3M": _made_from_attempt_string(
+                pick("3PT", "3PM", "threePointsMade", "threePointFieldGoalsMade", default=0)
+            ),
+        }
+        rows.append(row)
+
+    rows.sort(
+        key=lambda r: parse_game_date(r.get("GAME_DATE")) or datetime.min,
+        reverse=True,
+    )
+
+    if not rows:
+        raise RuntimeError("ESPN returned no game-log rows for this player.")
+
+    _cache_set(cache_key, rows)
+    return rows
+
+
+def averages_from_logs(logs: list[dict], stat_key: str) -> tuple[float | None, float | None]:
+    """Compute season stat average and minutes from the normalized game log."""
+    if not logs:
+        return None, None
+
+    values = []
+    minutes = []
+    for g in logs:
+        try:
+            values.append(float(g.get(stat_key, 0)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            minutes.append(float(g.get("MIN", 0)))
+        except (TypeError, ValueError):
+            pass
+
+    avg = round(sum(values) / len(values), 1) if values else None
+    min_avg = round(sum(minutes) / len(minutes), 1) if minutes else None
+    return avg, min_avg
+
+
 def threshold_for_sample(n: int) -> int | None:
     # User's strict rule:
     # 10 games -> 9/10
@@ -491,9 +770,23 @@ def home():
 def api_players():
     season = request.args.get("season", "2026")
     try:
-        return jsonify({"players": league_players(season), "source": "stats.wnba.com"})
+        players, source, warning = players_with_fallback(season)
+        return jsonify(
+            {
+                "players": players,
+                "source": source,
+                "warning": warning,
+            }
+        )
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 502
+        return jsonify(
+            {
+                "error": (
+                    "Could not load the WNBA player list from either the official "
+                    f"WNBA Stats service or the fallback source. {exc}"
+                )
+            }
+        ), 502
 
 
 @app.post("/api/analyze")
@@ -515,6 +808,38 @@ def api_analyze():
         return jsonify({"error": "Choose an opponent."}), 400
 
     try:
+        # If the dropdown was loaded from ESPN fallback, the ID carries an
+        # explicit prefix. Otherwise we use official WNBA Stats.
+        if player_id.startswith("espn:"):
+            players = espn_league_players(season)
+            player = next((p for p in players if p["player_id"] == player_id), None)
+            if not player:
+                raise RuntimeError("Selected ESPN player could not be found.")
+
+            provider_id = player_id.split(":", 1)[1]
+            logs = espn_player_logs(provider_id, season, player.get("team", ""))
+            analysis = analyze_prop(logs, stat, line, opponent)
+            season_average, season_minutes = averages_from_logs(logs, stat)
+
+            return jsonify(
+                {
+                    "player": player,
+                    "season_average": season_average,
+                    "season_minutes": season_minutes,
+                    "leader_context": None,
+                    "leader_error": "WNBA Leaders cross-check unavailable while using fallback mode.",
+                    "analysis": analysis,
+                    "source": "ESPN fallback (official WNBA Stats blocked from hosting server)",
+                    "note": (
+                        "The hosting server could not reach stats.wnba.com, so this "
+                        "analysis used ESPN's WNBA roster and player game-log data. "
+                        "The same strict August/September L10, L5 and current-season "
+                        "H2H rules were applied. Injury/availability is still separate."
+                    ),
+                }
+            )
+
+        # Official WNBA path
         players = league_players(season)
         player = next((p for p in players if p["player_id"] == player_id), None)
         logs = player_logs(player_id, season)
@@ -532,8 +857,6 @@ def api_analyze():
         try:
             leader_context = player_leader_context(player_id, season, stat)
         except Exception as leader_exc:
-            # Do not fail the entire prop analysis if the Leaders endpoint is
-            # temporarily throttled; expose the cross-check status to the UI.
             leader_error = str(leader_exc)
 
         return jsonify(
