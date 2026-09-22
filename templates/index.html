@@ -1,0 +1,583 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>WNBA Prop Analyzer</title>
+  <style>
+    :root{
+      --bg:#07111f; --bg2:#0a1628;
+      --panel:rgba(16,27,46,.92); --panel2:#17243a; --panel3:#1d2b44;
+      --text:#f8fbff; --muted:#9fb0c9; --border:#2a3b58;
+      --accent:#ff8a1f; --accent2:#ffb24d;
+      --ok:#39d98a; --warn:#ffd166; --bad:#ff6b6b;
+      --shadow:0 18px 45px rgba(0,0,0,.30);
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      background:
+        radial-gradient(circle at 14% 0%, rgba(255,138,31,.12), transparent 28%),
+        radial-gradient(circle at 86% 8%, rgba(85,135,255,.12), transparent 30%),
+        linear-gradient(180deg,var(--bg),var(--bg2));
+      color:var(--text); min-height:100vh;
+    }
+    .topbar{
+      position:sticky; top:0; z-index:20;
+      backdrop-filter:blur(14px);
+      background:rgba(7,17,31,.78);
+      border-bottom:1px solid rgba(255,255,255,.06);
+    }
+    .topbar-inner{
+      max-width:1180px; margin:auto; padding:13px 18px;
+      display:flex; align-items:center; justify-content:space-between; gap:16px;
+    }
+    .brand{display:flex;align-items:center;gap:12px;font-weight:900}
+    .brand-mark{
+      width:42px;height:42px;border-radius:14px;display:grid;place-items:center;
+      background:linear-gradient(135deg,var(--accent),var(--accent2));
+      color:#151515;font-size:21px;box-shadow:0 8px 20px rgba(255,138,31,.25)
+    }
+    .brand small{display:block;color:var(--muted);font-size:11px;font-weight:600;margin-top:2px}
+    .source-badge{
+      padding:8px 11px;border-radius:999px;border:1px solid var(--border);
+      background:rgba(255,255,255,.04);color:var(--muted);font-size:12px;white-space:nowrap
+    }
+    .wrap{max-width:1180px;margin:auto;padding:27px 18px 60px}
+    .intro{display:flex;justify-content:space-between;align-items:end;gap:18px;flex-wrap:wrap;margin-bottom:22px}
+    h1{margin:0;font-size:clamp(30px,4vw,44px);line-height:1.04}
+    .sub{color:var(--muted);line-height:1.55;margin:9px 0 0;max-width:790px}
+    .card{
+      background:linear-gradient(180deg,rgba(19,31,52,.96),rgba(14,24,42,.96));
+      border:1px solid rgba(255,255,255,.08); border-radius:20px;
+      padding:20px;margin-bottom:18px;box-shadow:var(--shadow)
+    }
+    .card-title{font-size:14px;font-weight:900;margin-bottom:14px;color:#eaf2ff}
+    .grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}
+    label{
+      display:block;color:var(--muted);font-size:11px;font-weight:800;
+      margin-bottom:7px;text-transform:uppercase;letter-spacing:.45px
+    }
+    select,input,button{
+      width:100%;border-radius:12px;border:1px solid var(--border);
+      background:var(--panel2);color:var(--text);padding:12px 13px;font-size:14px;outline:none;
+      transition:.18s ease
+    }
+    select:focus,input:focus{border-color:#5478b7;box-shadow:0 0 0 3px rgba(84,120,183,.16)}
+    button{
+      background:linear-gradient(135deg,var(--accent),var(--accent2));
+      color:#121212;font-weight:950;border:none;cursor:pointer;margin-top:18px;
+      box-shadow:0 10px 24px rgba(255,138,31,.22)
+    }
+    button:hover{transform:translateY(-1px);filter:brightness(1.04)}
+    button:disabled{opacity:.55;cursor:not-allowed;transform:none}
+    .selector-logo{
+      display:grid;grid-template-columns:48px 1fr;gap:9px;align-items:center
+    }
+    .logo-box{
+      width:48px;height:48px;border-radius:13px;border:1px solid var(--border);
+      background:#0d1728;display:grid;place-items:center;overflow:hidden
+    }
+    .logo-box img{width:39px;height:39px;object-fit:contain}
+    .logo-fallback{font-size:10px;font-weight:900;color:var(--muted)}
+    .matchup{
+      display:none;margin-top:16px;padding:14px 16px;border:1px solid var(--border);
+      background:rgba(255,255,255,.025);border-radius:16px;align-items:center;gap:15px
+    }
+    .matchup.show{display:flex}
+    .match-side{flex:1;display:flex;align-items:center;gap:11px;font-weight:900;min-width:0}
+    .match-side.right{justify-content:flex-end;text-align:right}
+    .match-logo{width:55px;height:55px;object-fit:contain;filter:drop-shadow(0 6px 10px rgba(0,0,0,.28))}
+    .vs{font-size:12px;font-weight:950;color:var(--muted);letter-spacing:1px}
+    .status{margin-top:12px;color:var(--muted);font-size:13px;min-height:18px}
+    .error{color:var(--bad)}
+    .hidden{display:none}
+    .hero{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}
+    .player-profile{display:flex;align-items:center;gap:16px}
+    .player-photo-wrap{
+      width:128px;height:104px;border-radius:18px;overflow:hidden;
+      background:linear-gradient(180deg,#223354,#0d1728);border:1px solid var(--border);
+      position:relative;display:grid;place-items:center
+    }
+    .player-photo{width:100%;height:100%;object-fit:cover;object-position:center 12%;transform:scale(1.03)}
+    .photo-fallback{
+      width:100%;height:100%;display:none;place-items:center;font-size:26px;font-weight:950;color:var(--muted)
+    }
+    .result-team-row{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:13px;font-weight:700}
+    .result-team-logo{width:24px;height:24px;object-fit:contain}
+    .hero h2{margin:0 0 6px;font-size:27px}
+    .pill{
+      padding:10px 13px;border-radius:999px;font-weight:950;
+      background:var(--panel2);border:1px solid var(--border);white-space:nowrap
+    }
+    .pill.hot{color:var(--ok);border-color:rgba(57,217,138,.6);background:rgba(57,217,138,.08)}
+    .pill.close{color:var(--warn);border-color:rgba(255,209,102,.6);background:rgba(255,209,102,.08)}
+    .pill.fail{color:var(--bad);border-color:rgba(255,107,107,.6);background:rgba(255,107,107,.08)}
+    .metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:19px}
+    .metric{
+      background:linear-gradient(180deg,var(--panel2),#142036);
+      border:1px solid var(--border);border-radius:14px;padding:14px
+    }
+    .metric .k{color:var(--muted);font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.5px}
+    .metric .v{font-size:22px;font-weight:950;margin-top:4px}
+    .section-title{font-weight:950;margin:23px 0 10px;color:#edf4ff}
+    .values{
+      background:#0d1728;border:1px solid var(--border);border-radius:14px;
+      padding:13px 14px;font-size:18px;font-weight:850;line-height:1.7
+    }
+    .hit{color:var(--ok)} .miss{color:var(--bad)}
+    .legend{display:flex;gap:16px;margin-top:8px;color:var(--muted);font-size:11px}
+    .dot{width:8px;height:8px;display:inline-block;border-radius:50%;margin-right:5px}
+    .dot.hitdot{background:var(--ok)} .dot.missdot{background:var(--bad)}
+    .tables{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:4px}
+    .table-card{background:#0d1728;border:1px solid var(--border);border-radius:14px;overflow:hidden}
+    .table-card .section-title{margin:0;padding:13px 14px;border-bottom:1px solid var(--border);font-size:13px}
+    table{width:100%;border-collapse:collapse;font-size:12px}
+    th,td{text-align:left;padding:9px 10px;border-bottom:1px solid rgba(42,59,88,.7)}
+    th{color:var(--muted);font-weight:700}
+    tr:last-child td{border-bottom:none}
+    .note{
+      margin-top:17px;color:var(--muted);font-size:12px;line-height:1.55;
+      padding:12px 14px;background:rgba(255,255,255,.025);border-radius:12px;border:1px solid var(--border)
+    }
+    .source{font-size:11px;color:var(--muted);margin-top:8px}
+    .footer{text-align:center;color:#71829e;font-size:11px;padding:4px 0 0}
+    @media(max-width:930px){
+      .grid{grid-template-columns:1fr 1fr}
+      .metrics{grid-template-columns:repeat(3,1fr)}
+      .tables{grid-template-columns:1fr}
+    }
+    @media(max-width:590px){
+      .source-badge{display:none}
+      .grid,.metrics{grid-template-columns:1fr}
+      .matchup{padding:10px}.match-logo{width:43px;height:43px}
+      .player-photo-wrap{width:88px;height:78px}
+      .hero h2{font-size:22px}
+      .player-profile{align-items:flex-start}
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <div class="brand-mark">🏀</div>
+        <div>WNBA Prop Analyzer<small>Strict recent-form analysis</small></div>
+      </div>
+      <div class="source-badge">Official WNBA Stats</div>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="intro">
+      <div>
+        <h1>Analyze a WNBA prop.</h1>
+        <div class="sub">
+          Official game logs, August–September recent form, current-season H2H,
+          season averages and your strict pass thresholds.
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Select matchup and prop</div>
+      <div class="grid">
+        <div>
+          <label>Season</label>
+          <select id="season">
+            <option value="2026" selected>2026</option>
+            <option value="2025">2025</option>
+            <option value="2024">2024</option>
+          </select>
+        </div>
+
+        <div>
+          <label>Team</label>
+          <div class="selector-logo">
+            <div class="logo-box">
+              <img id="teamLogo" alt="" style="display:none">
+              <div id="teamLogoFallback" class="logo-fallback">TEAM</div>
+            </div>
+            <select id="team"><option>Loading...</option></select>
+          </div>
+        </div>
+
+        <div>
+          <label>Player</label>
+          <select id="player"><option>Select a team first</option></select>
+        </div>
+
+        <div>
+          <label>Opponent</label>
+          <div class="selector-logo">
+            <div class="logo-box">
+              <img id="oppLogo" alt="" style="display:none">
+              <div id="oppLogoFallback" class="logo-fallback">OPP</div>
+            </div>
+            <select id="opponent"><option>Select opponent</option></select>
+          </div>
+        </div>
+
+        <div>
+          <label>Market</label>
+          <select id="stat">
+            <option value="PTS">Points</option>
+            <option value="REB">Rebounds</option>
+            <option value="AST">Assists</option>
+            <option value="FG3M">3-Pointers Made</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="grid" style="margin-top:12px">
+        <div>
+          <label>Prop line</label>
+          <input id="line" type="number" min="0" step="0.5" placeholder="Example: 10">
+        </div>
+        <div style="grid-column:span 2">
+          <button id="analyze">Analyze Prop</button>
+        </div>
+      </div>
+
+      <div id="matchupPreview" class="matchup">
+        <div class="match-side">
+          <img id="previewTeamLogo" class="match-logo" alt="">
+          <span id="previewTeamText"></span>
+        </div>
+        <div class="vs">VS</div>
+        <div class="match-side right">
+          <span id="previewOppText"></span>
+          <img id="previewOppLogo" class="match-logo" alt="">
+        </div>
+      </div>
+
+      <div id="status" class="status"></div>
+    </div>
+
+    <div id="result" class="card hidden">
+      <div class="hero">
+        <div class="player-profile">
+          <div class="player-photo-wrap">
+            <img id="playerPhoto" class="player-photo" alt="">
+            <div id="photoFallback" class="photo-fallback">WNBA</div>
+          </div>
+          <div>
+            <h2 id="resultTitle"></h2>
+            <div class="result-team-row">
+              <img id="resultTeamLogo" class="result-team-logo" alt="">
+              <span id="resultSub"></span>
+            </div>
+          </div>
+        </div>
+        <div id="verdict" class="pill"></div>
+      </div>
+
+      <div class="metrics">
+        <div class="metric"><div class="k">Season average</div><div id="avg" class="v">—</div></div>
+        <div class="metric"><div class="k">Season minutes</div><div id="mins" class="v">—</div></div>
+        <div class="metric"><div class="k">L10 hit rate</div><div id="l10rate" class="v">—</div></div>
+        <div class="metric"><div class="k">L5 hit rate</div><div id="l5rate" class="v">—</div></div>
+        <div class="metric"><div class="k">WNBA Leaders rank</div><div id="leaderRank" class="v">—</div></div>
+      </div>
+
+      <div class="section-title">Last 10 — newest → oldest</div>
+      <div id="l10values" class="values"></div>
+
+      <div class="section-title">Last 5</div>
+      <div id="l5values" class="values"></div>
+
+      <div class="section-title">Current-season H2H</div>
+      <div id="h2hvalues" class="values"></div>
+
+      <div class="legend">
+        <span><span class="dot hitdot"></span>hit</span>
+        <span><span class="dot missdot"></span>miss</span>
+      </div>
+
+      <div class="tables">
+        <div class="table-card">
+          <div class="section-title">Recent-game detail</div>
+          <table>
+            <thead><tr><th>Date</th><th>Matchup</th><th>MIN</th><th>Value</th></tr></thead>
+            <tbody id="recentRows"></tbody>
+          </table>
+        </div>
+
+        <div class="table-card">
+          <div class="section-title">H2H detail</div>
+          <table>
+            <thead><tr><th>Date</th><th>Matchup</th><th>MIN</th><th>Value</th></tr></thead>
+            <tbody id="h2hRows"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div id="note" class="note"></div>
+      <div id="source" class="source"></div>
+    </div>
+
+    <div class="footer">Runs locally • Data requested directly from official WNBA Stats services</div>
+  </div>
+
+<script>
+let players = [];
+let teams = [];
+const $ = id => document.getElementById(id);
+
+function numberText(v) {
+  if (v === null || v === undefined || v === "") return "—";
+  const n = Number(v);
+  return Number.isFinite(n) ? (Number.isInteger(n) ? String(n) : n.toFixed(1)) : String(v);
+}
+
+/*
+  Official NBA/WNBA CDN patterns. If an image is unavailable, the UI gracefully
+  hides it and shows a text fallback instead.
+*/
+function teamLogoUrl(teamId) {
+  return teamId ? `https://cdn.nba.com/logos/wnba/${teamId}/primary/L/logo.svg` : "";
+}
+
+function playerPhotoUrl(playerId) {
+  // Use the local proxy because direct WNBA CDN hotlinking from localhost can
+  // fail even when the same official headshot is available on WNBA.com.
+  return playerId ? `/api/player-image/${playerId}` : "";
+}
+
+function teamRecordByAbbr(abbr) {
+  return players.find(p => p.team === abbr);
+}
+
+function teamIdByAbbr(abbr) {
+  const p = teamRecordByAbbr(abbr);
+  return p ? p.team_id : "";
+}
+
+function setLogo(imgId, fallbackId, teamAbbr) {
+  const img = $(imgId);
+  const fallback = $(fallbackId);
+  const tid = teamIdByAbbr(teamAbbr);
+
+  if (!teamAbbr || !tid) {
+    img.style.display = "none";
+    fallback.style.display = "block";
+    fallback.textContent = teamAbbr || (fallbackId.includes("opp") ? "OPP" : "TEAM");
+    return;
+  }
+
+  fallback.textContent = teamAbbr;
+  fallback.style.display = "none";
+  img.style.display = "block";
+  img.src = teamLogoUrl(tid);
+  img.onerror = () => {
+    img.style.display = "none";
+    fallback.style.display = "block";
+  };
+}
+
+function setPlainLogo(imgId, teamAbbr) {
+  const img = $(imgId);
+  const tid = teamIdByAbbr(teamAbbr);
+  if (!tid) {
+    img.style.visibility = "hidden";
+    return;
+  }
+  img.style.visibility = "visible";
+  img.src = teamLogoUrl(tid);
+  img.onerror = () => img.style.visibility = "hidden";
+}
+
+function updateMatchupPreview() {
+  const team = $("team").value;
+  const opp = $("opponent").value;
+  setLogo("teamLogo", "teamLogoFallback", team);
+  setLogo("oppLogo", "oppLogoFallback", opp);
+
+  const box = $("matchupPreview");
+  if (team && opp && team !== opp) {
+    $("previewTeamText").textContent = team;
+    $("previewOppText").textContent = opp;
+    setPlainLogo("previewTeamLogo", team);
+    setPlainLogo("previewOppLogo", opp);
+    box.classList.add("show");
+  } else {
+    box.classList.remove("show");
+  }
+}
+
+async function loadPlayers() {
+  $("status").textContent = "Loading official WNBA player list...";
+  $("analyze").disabled = true;
+  const season = $("season").value;
+  try {
+    const r = await fetch(`/api/players?season=${encodeURIComponent(season)}`);
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || "Could not load players.");
+
+    players = data.players || [];
+    teams = [...new Set(players.map(p => p.team).filter(Boolean))].sort();
+
+    $("team").innerHTML = `<option value="">Select team</option>` +
+      teams.map(t => `<option value="${t}">${t}</option>`).join("");
+
+    $("opponent").innerHTML = `<option value="">Select opponent</option>` +
+      teams.map(t => `<option value="${t}">${t}</option>`).join("");
+
+    $("player").innerHTML = `<option value="">Select a team first</option>`;
+    $("status").textContent = `Loaded ${players.length} player/team records from official WNBA Stats.`;
+    updateMatchupPreview();
+  } catch (e) {
+    $("status").innerHTML = `<span class="error">${e.message}</span>`;
+  } finally {
+    $("analyze").disabled = false;
+  }
+}
+
+function populatePlayers() {
+  const team = $("team").value;
+  const list = players.filter(p => p.team === team);
+  $("player").innerHTML = `<option value="">Select player</option>` +
+    list.map(p => `<option value="${p.player_id}">${p.player_name}</option>`).join("");
+
+  if ($("opponent").value === team) $("opponent").value = "";
+  updateMatchupPreview();
+}
+
+function coloredValues(values, line) {
+  if (!values.length) return "No applicable games";
+  return values.map(v => {
+    const cls = Number(v) >= Number(line) ? "hit" : "miss";
+    return `<span class="${cls}">${v}</span>`;
+  }).join(", ");
+}
+
+function detailRows(rows, line) {
+  if (!rows.length) return `<tr><td colspan="4">No games found.</td></tr>`;
+  return rows.map(g => {
+    const cls = Number(g.value) >= Number(line) ? "hit" : "miss";
+    return `<tr>
+      <td>${g.date ?? ""}</td>
+      <td>${g.matchup ?? ""}</td>
+      <td>${g.min ?? ""}</td>
+      <td class="${cls}"><strong>${g.value}</strong></td>
+    </tr>`;
+  }).join("");
+}
+
+function showPlayerPhoto(playerId, playerName) {
+  const img = $("playerPhoto");
+  const fallback = $("photoFallback");
+
+  fallback.textContent = (playerName || "WNBA")
+    .split(/\s+/)
+    .map(x => x[0] || "")
+    .slice(0,2)
+    .join("")
+    .toUpperCase();
+
+  fallback.style.display = "none";
+  img.style.display = "block";
+  img.src = playerPhotoUrl(playerId);
+  img.onerror = () => {
+    img.style.display = "none";
+    fallback.style.display = "grid";
+  };
+}
+
+$("team").addEventListener("change", populatePlayers);
+$("opponent").addEventListener("change", updateMatchupPreview);
+$("season").addEventListener("change", loadPlayers);
+
+$("analyze").addEventListener("click", async () => {
+  const player_id = $("player").value;
+  const opponent = $("opponent").value;
+  const stat = $("stat").value;
+  const line = $("line").value;
+  const season = $("season").value;
+
+  if (!player_id || !opponent || line === "") {
+    $("status").innerHTML = `<span class="error">Choose a player, opponent, and line.</span>`;
+    return;
+  }
+
+  const chosenPlayer = players.find(p => p.player_id === player_id);
+
+  if (chosenPlayer && chosenPlayer.team === opponent) {
+    $("status").innerHTML = `<span class="error">Opponent cannot be the player's own team.</span>`;
+    return;
+  }
+
+  $("analyze").disabled = true;
+  $("status").textContent = "Pulling official WNBA logs and calculating...";
+  $("result").classList.add("hidden");
+
+  try {
+    const r = await fetch("/api/analyze", {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({season,player_id,opponent,stat,line})
+    });
+
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || "Analysis failed.");
+
+    const a = data.analysis;
+    const player = data.player || {};
+    const statLabel = {
+      PTS:"Points", REB:"Rebounds", AST:"Assists", FG3M:"3-Pointers Made"
+    }[stat];
+
+    showPlayerPhoto(player.player_id, player.player_name);
+    setPlainLogo("resultTeamLogo", player.team);
+
+    $("resultTitle").textContent = `${player.player_name || "Player"} — ${line}+ ${statLabel}`;
+    $("resultSub").textContent = `${player.team || ""} vs ${opponent} • ${season} Regular Season`;
+
+    $("verdict").textContent = a.verdict;
+    $("verdict").className = `pill ${a.verdict_code}`;
+
+    $("avg").textContent = numberText(data.season_average);
+    $("mins").textContent = numberText(data.season_minutes);
+    $("l10rate").textContent = `${a.l10_hits}/${a.l10_games}`;
+    $("l5rate").textContent = `${a.l5_hits}/${a.l5_games}`;
+
+    const lc = data.leader_context || {};
+    $("leaderRank").textContent = lc.rank ? `#${lc.rank}` : "—";
+
+    $("l10values").innerHTML = coloredValues(a.l10_values, line);
+    $("l5values").innerHTML = coloredValues(a.l5_values, line);
+    $("h2hvalues").innerHTML = a.h2h_values.length
+      ? `${coloredValues(a.h2h_values, line)} &nbsp; (${a.h2h_hits}/${a.h2h_games})`
+      : "No current-season H2H game found.";
+
+    $("recentRows").innerHTML = detailRows(a.recent_games, line);
+    $("h2hRows").innerHTML = detailRows(a.h2h_games_detail, line);
+
+    $("note").textContent = data.note || "";
+
+    let leaderExtra = "";
+    if (data.leader_context && data.leader_context.rank) {
+      leaderExtra = ` • Leaders cross-check: rank #${data.leader_context.rank}`;
+      if (data.leader_context.value !== null && data.leader_context.value !== undefined) {
+        leaderExtra += ` (${numberText(data.leader_context.value)})`;
+      }
+    } else if (data.leader_error) {
+      leaderExtra = " • Leaders cross-check temporarily unavailable";
+    }
+
+    $("source").textContent = `Source: ${data.source || "Official WNBA Stats"}${leaderExtra}`;
+    $("result").classList.remove("hidden");
+    $("status").textContent = "Analysis complete.";
+    $("result").scrollIntoView({behavior:"smooth", block:"start"});
+  } catch (e) {
+    $("status").innerHTML = `<span class="error">${e.message}</span>`;
+  } finally {
+    $("analyze").disabled = false;
+  }
+});
+
+loadPlayers();
+</script>
+</body>
+</html>
