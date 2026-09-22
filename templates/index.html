@@ -349,17 +349,19 @@ function teamRecordByAbbr(abbr) {
   return players.find(p => p.team === abbr);
 }
 
-function teamIdByAbbr(abbr) {
+function teamLogoForAbbr(abbr) {
   const p = teamRecordByAbbr(abbr);
-  return p ? p.team_id : "";
+  if (!p) return "";
+  if (p.team_logo) return p.team_logo;
+  return p.team_id ? teamLogoUrl(p.team_id) : "";
 }
 
 function setLogo(imgId, fallbackId, teamAbbr) {
   const img = $(imgId);
   const fallback = $(fallbackId);
-  const tid = teamIdByAbbr(teamAbbr);
+  const logo = teamLogoForAbbr(teamAbbr);
 
-  if (!teamAbbr || !tid) {
+  if (!teamAbbr || !logo) {
     img.style.display = "none";
     fallback.style.display = "block";
     fallback.textContent = teamAbbr || (fallbackId.includes("opp") ? "OPP" : "TEAM");
@@ -369,7 +371,7 @@ function setLogo(imgId, fallbackId, teamAbbr) {
   fallback.textContent = teamAbbr;
   fallback.style.display = "none";
   img.style.display = "block";
-  img.src = teamLogoUrl(tid);
+  img.src = logo;
   img.onerror = () => {
     img.style.display = "none";
     fallback.style.display = "block";
@@ -378,13 +380,13 @@ function setLogo(imgId, fallbackId, teamAbbr) {
 
 function setPlainLogo(imgId, teamAbbr) {
   const img = $(imgId);
-  const tid = teamIdByAbbr(teamAbbr);
-  if (!tid) {
+  const logo = teamLogoForAbbr(teamAbbr);
+  if (!logo) {
     img.style.visibility = "hidden";
     return;
   }
   img.style.visibility = "visible";
-  img.src = teamLogoUrl(tid);
+  img.src = logo;
   img.onerror = () => img.style.visibility = "hidden";
 }
 
@@ -406,13 +408,25 @@ function updateMatchupPreview() {
   }
 }
 
+async function readJsonResponse(response) {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    const preview = text.replace(/\s+/g, " ").slice(0, 180);
+    throw new Error(
+      `Server returned a non-JSON response (${response.status}). ${preview || "No response body."}`
+    );
+  }
+}
+
 async function loadPlayers() {
   $("status").textContent = "Loading official WNBA player list...";
   $("analyze").disabled = true;
   const season = $("season").value;
   try {
     const r = await fetch(`/api/players?season=${encodeURIComponent(season)}`);
-    const data = await r.json();
+    const data = await readJsonResponse(r);
     if (!r.ok) throw new Error(data.error || "Could not load players.");
 
     players = data.players || [];
@@ -425,7 +439,10 @@ async function loadPlayers() {
       teams.map(t => `<option value="${t}">${t}</option>`).join("");
 
     $("player").innerHTML = `<option value="">Select a team first</option>`;
-    $("status").textContent = `Loaded ${players.length} player/team records from official WNBA Stats.`;
+    const sourceText = data.source || "WNBA data source";
+    $("status").innerHTML = data.warning
+      ? `Loaded ${players.length} player/team records via <strong>${sourceText}</strong>. <span style="color:#ffd166">Fallback mode is active because stats.wnba.com is blocked from this host.</span>`
+      : `Loaded ${players.length} player/team records from <strong>${sourceText}</strong>.`;
     updateMatchupPreview();
   } catch (e) {
     $("status").innerHTML = `<span class="error">${e.message}</span>`;
@@ -465,20 +482,32 @@ function detailRows(rows, line) {
   }).join("");
 }
 
-function showPlayerPhoto(playerId, playerName) {
+function showPlayerPhoto(player) {
   const img = $("playerPhoto");
   const fallback = $("photoFallback");
+  const playerName = player?.player_name || "WNBA";
 
-  fallback.textContent = (playerName || "WNBA")
+  fallback.textContent = playerName
     .split(/\s+/)
     .map(x => x[0] || "")
     .slice(0,2)
     .join("")
     .toUpperCase();
 
+  const photo = player?.photo_url ||
+    (String(player?.player_id || "").startsWith("espn:")
+      ? ""
+      : playerPhotoUrl(player?.player_id));
+
+  if (!photo) {
+    img.style.display = "none";
+    fallback.style.display = "grid";
+    return;
+  }
+
   fallback.style.display = "none";
   img.style.display = "block";
-  img.src = playerPhotoUrl(playerId);
+  img.src = photo;
   img.onerror = () => {
     img.style.display = "none";
     fallback.style.display = "grid";
@@ -519,7 +548,7 @@ $("analyze").addEventListener("click", async () => {
       body:JSON.stringify({season,player_id,opponent,stat,line})
     });
 
-    const data = await r.json();
+    const data = await readJsonResponse(r);
     if (!r.ok) throw new Error(data.error || "Analysis failed.");
 
     const a = data.analysis;
@@ -528,7 +557,7 @@ $("analyze").addEventListener("click", async () => {
       PTS:"Points", REB:"Rebounds", AST:"Assists", FG3M:"3-Pointers Made"
     }[stat];
 
-    showPlayerPhoto(player.player_id, player.player_name);
+    showPlayerPhoto(player);
     setPlainLogo("resultTeamLogo", player.team);
 
     $("resultTitle").textContent = `${player.player_name || "Player"} — ${line}+ ${statLabel}`;
