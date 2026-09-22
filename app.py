@@ -17,6 +17,8 @@ LEAGUE_ID = "10"
 
 ESPN_SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba"
 ESPN_WEB_BASE = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/wnba"
+ESPN_CORE_V2_BASE = "https://sports.core.api.espn.com/v2/sports/basketball/leagues/wnba"
+ESPN_CORE_V3_BASE = "https://sports.core.api.espn.com/v3/sports/basketball/wnba"
 
 # Browser-like headers are important for the official WNBA/NBA stats service.
 HEADERS = {
@@ -335,6 +337,274 @@ def espn_get(url: str, params: dict[str, Any] | None = None, timeout: int = 8) -
     raise RuntimeError(f"ESPN fallback request failed: {last_error}")
 
 
+
+def espn_core_get(url: str, params: dict[str, Any] | None = None, timeout: int = 10) -> dict:
+    """
+    Fetch JSON from ESPN's sports.core.api.espn.com host.
+
+    This host is used for the Render fallback because site.api.espn.com can
+    return HTTP 403 from some cloud-provider IP ranges.
+    """
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": HEADERS["User-Agent"],
+        "Referer": "https://www.espn.com/",
+        "Origin": "https://www.espn.com",
+    }
+
+    last_error = None
+    for attempt in range(2):
+        try:
+            response = requests.get(
+                url,
+                params=params or {},
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+            text = response.text.lstrip()
+            if text.startswith("<"):
+                raise RuntimeError(
+                    f"ESPN Core returned HTML instead of JSON (HTTP {response.status_code})."
+                )
+            return response.json()
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(0.4)
+
+    raise RuntimeError(f"ESPN Core request failed: {last_error}")
+
+
+def _first_nonempty(mapping: dict, *keys):
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _extract_core_items(payload: dict) -> list[dict]:
+    """Accept the common ESPN Core v2/v3 collection shapes."""
+    for key in ("items", "athletes", "results"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [x for x in value if isinstance(x, dict)]
+
+    # Some v3 responses wrap collections one level deeper.
+    for key in ("data", "content"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            nested = _extract_core_items(value)
+            if nested:
+                return nested
+
+    return []
+
+
+def _extract_team_from_core_athlete(athlete: dict) -> tuple[str, str, str | None]:
+    """
+    Return (team_id, abbreviation, logo_url) from several ESPN athlete schemas.
+    """
+    candidate = athlete.get("team")
+
+    if not isinstance(candidate, dict):
+        teams = athlete.get("teams")
+        if isinstance(teams, list) and teams:
+            first = teams[0]
+            if isinstance(first, dict):
+                candidate = first
+
+    if not isinstance(candidate, dict):
+        candidate = {}
+
+    team_id = str(
+        _first_nonempty(
+            candidate,
+            "id",
+            "teamId",
+            "uid",
+        )
+        or _first_nonempty(athlete, "teamId", "team_id")
+        or ""
+    )
+
+    abbr = str(
+        _first_nonempty(
+            candidate,
+            "abbreviation",
+            "abbr",
+            "shortDisplayName",
+        )
+        or _first_nonempty(athlete, "teamAbbreviation", "teamAbbr")
+        or ""
+    ).upper()
+
+    logo_url = None
+    logos = candidate.get("logos")
+    if isinstance(logos, list) and logos:
+        first_logo = logos[0]
+        if isinstance(first_logo, dict):
+            logo_url = first_logo.get("href")
+    elif isinstance(candidate.get("logo"), str):
+        logo_url = candidate.get("logo")
+
+    return team_id, abbr, logo_url
+
+
+def _extract_headshot(athlete: dict) -> str | None:
+    headshot = athlete.get("headshot")
+    if isinstance(headshot, dict):
+        return headshot.get("href")
+    if isinstance(headshot, str):
+        return headshot
+
+    images = athlete.get("images")
+    if isinstance(images, list):
+        for img in images:
+            if isinstance(img, dict) and img.get("href"):
+                return img["href"]
+
+    return None
+
+
+def _normalize_core_athlete(athlete: dict) -> dict | None:
+    athlete_id = str(_first_nonempty(athlete, "id", "athleteId") or "")
+    if not athlete_id:
+        return None
+
+    name = str(
+        _first_nonempty(
+            athlete,
+            "fullName",
+            "displayName",
+            "name",
+            "shortName",
+        )
+        or ""
+    )
+
+    team_id, team_abbr, team_logo = _extract_team_from_core_athlete(athlete)
+
+    if not name:
+        return None
+
+    return {
+        "player_id": f"espn:{athlete_id}",
+        "provider_player_id": athlete_id,
+        "provider": "espn-core",
+        "player_name": name,
+        "team_id": team_id,
+        "team": team_abbr,
+        "team_logo": team_logo,
+        "photo_url": _extract_headshot(athlete),
+        "season_pts": None,
+        "season_reb": None,
+        "season_ast": None,
+        "season_fg3m": None,
+        "season_min": None,
+        "gp": None,
+    }
+
+
+def espn_core_players(season: str) -> list[dict]:
+    """
+    Load active WNBA athletes from ESPN Core API.
+
+    v3 is attempted first because it returns the richer athlete schema. If v3
+    returns an unexpected collection shape, v2 is attempted as a secondary Core
+    endpoint. The app does not call site.api.espn.com for the Render roster.
+    """
+    cache_key = f"espn-core-players:{season}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    errors = []
+    payload = None
+
+    core_attempts = [
+        (
+            f"{ESPN_CORE_V3_BASE}/athletes",
+            {"active": "true", "limit": 1000},
+        ),
+        (
+            f"{ESPN_CORE_V2_BASE}/athletes",
+            {"active": "true", "limit": 1000},
+        ),
+    ]
+
+    for url, params in core_attempts:
+        try:
+            candidate = espn_core_get(url, params=params, timeout=10)
+            items = _extract_core_items(candidate)
+            if items:
+                payload = candidate
+                break
+            errors.append(f"{url}: no athlete items")
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+
+    if payload is None:
+        raise RuntimeError(
+            "ESPN Core athlete directory failed. " + " | ".join(errors[:2])
+        )
+
+    players = []
+    missing_team = []
+
+    for athlete in _extract_core_items(payload):
+        normalized = _normalize_core_athlete(athlete)
+        if not normalized:
+            continue
+        if normalized["team"]:
+            players.append(normalized)
+        else:
+            missing_team.append((normalized, athlete))
+
+    # If the enriched list omitted team metadata for a small number of athletes,
+    # try the individual Core v3 athlete profile concurrently.
+    if missing_team:
+        def fetch_profile(entry):
+            normalized, _raw = entry
+            athlete_id = normalized["provider_player_id"]
+            try:
+                profile = espn_core_get(
+                    f"{ESPN_CORE_V3_BASE}/athletes/{athlete_id}",
+                    timeout=7,
+                )
+                upgraded = _normalize_core_athlete(profile)
+                return upgraded or normalized
+            except Exception:
+                return normalized
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(fetch_profile, entry) for entry in missing_team]
+            for future in as_completed(futures):
+                player = future.result()
+                if player.get("team"):
+                    players.append(player)
+
+    # Deduplicate and ignore athletes that still have no current WNBA team.
+    deduped = {}
+    for p in players:
+        key = (p["provider_player_id"], p["team"])
+        deduped[key] = p
+
+    players = list(deduped.values())
+    players.sort(key=lambda x: (x["team"], x["player_name"]))
+
+    if not players:
+        raise RuntimeError(
+            "ESPN Core returned athletes, but none included usable current WNBA team data."
+        )
+
+    _cache_set(cache_key, players)
+    return players
+
+
 def _espn_team_entries(payload: dict) -> list[dict]:
     """Extract team objects from ESPN's WNBA teams response."""
     teams = []
@@ -485,19 +755,20 @@ def espn_league_players(season: str) -> list[dict]:
 
 def players_with_fallback(season: str) -> tuple[list[dict], str, str | None]:
     """
-    Prefer official WNBA Stats on normal/local networks.
+    Source order:
+      Local/non-cloud: Official WNBA Stats -> ESPN Core
+      Render/cloud: ESPN Core directly
 
-    Render cloud IPs are frequently challenged by stats.wnba.com. On Render we
-    go directly to the ESPN fallback instead of waiting for the official request
-    to time out and causing a Gunicorn 500/worker timeout.
+    stats.wnba.com and site.api.espn.com can both reject datacenter IPs, so the
+    online roster path uses sports.core.api.espn.com instead.
     """
     on_render = bool(os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID"))
 
     if on_render:
-        fallback = espn_league_players(season)
+        core_players = espn_core_players(season)
         return (
-            fallback,
-            "ESPN fallback",
+            core_players,
+            "ESPN Core fallback",
             "Online fallback mode is active because stats.wnba.com can block Render cloud requests.",
         )
 
@@ -512,11 +783,11 @@ def players_with_fallback(season: str) -> tuple[list[dict], str, str | None]:
             return official, "Official WNBA Stats", None
         raise RuntimeError("Official WNBA Stats returned no players.")
     except Exception as exc:
-        fallback = espn_league_players(season)
+        core_players = espn_core_players(season)
         return (
-            fallback,
-            "ESPN fallback",
-            f"Official WNBA Stats was unavailable, so the app switched to ESPN. {exc}",
+            core_players,
+            "ESPN Core fallback",
+            f"Official WNBA Stats was unavailable, so the app switched to ESPN Core. {exc}",
         )
 
 
@@ -852,7 +1123,7 @@ def api_players():
             {
                 "error": (
                     "Could not load the WNBA player list from either the official "
-                    f"WNBA Stats service or the fallback source. {exc}"
+                    f"WNBA Stats service or ESPN Core fallback. {exc}"
                 )
             }
         ), 502
@@ -880,10 +1151,10 @@ def api_analyze():
         # If the dropdown was loaded from ESPN fallback, the ID carries an
         # explicit prefix. Otherwise we use official WNBA Stats.
         if player_id.startswith("espn:"):
-            players = espn_league_players(season)
+            players = espn_core_players(season)
             player = next((p for p in players if p["player_id"] == player_id), None)
             if not player:
-                raise RuntimeError("Selected ESPN player could not be found.")
+                raise RuntimeError("Selected ESPN Core player could not be found.")
 
             provider_id = player_id.split(":", 1)[1]
             logs = espn_player_logs(provider_id, season, player.get("team", ""))
@@ -898,10 +1169,10 @@ def api_analyze():
                     "leader_context": None,
                     "leader_error": "WNBA Leaders cross-check unavailable while using fallback mode.",
                     "analysis": analysis,
-                    "source": "ESPN fallback (official WNBA Stats blocked from hosting server)",
+                    "source": "ESPN Core roster + ESPN Web game logs (online fallback mode)",
                     "note": (
-                        "The hosting server could not reach stats.wnba.com, so this "
-                        "analysis used ESPN's WNBA roster and player game-log data. "
+                        "The hosting server could not reliably reach stats.wnba.com, so this "
+                        "analysis used ESPN Core for the WNBA roster and ESPN Web for player game logs. "
                         "The same strict August/September L10, L5 and current-season "
                         "H2H rules were applied. Injury/availability is still separate."
                     ),

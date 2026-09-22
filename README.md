@@ -133,3 +133,18 @@ v7 changes the online startup path:
 - Returns JSON for unexpected `/api/*` errors instead of an HTML 500 page.
 - Raises the Render Gunicorn timeout to 120 seconds as an extra safety margin.
 - Local use still prefers official WNBA Stats first.
+
+
+## v8 ESPN Core fallback
+
+Render returned HTTP 403 from `site.api.espn.com`, so v8 no longer uses that host
+for the online team/player dropdown.
+
+Online source path:
+- Player directory / roster context: `sports.core.api.espn.com`
+- Player game logs: ESPN Web API
+- Official WNBA Stats remains the preferred source for local use
+
+ESPN Core v3 athletes is attempted first, then Core v2 as a backup. The parser
+accepts several athlete/team schema variants and falls back to individual Core
+athlete profiles when team metadata is missing from the collection response.

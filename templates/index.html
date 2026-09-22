@@ -415,7 +415,7 @@ async function readJsonResponse(response) {
   } catch {
     const preview = text.replace(/\s+/g, " ").slice(0, 180);
     throw new Error(
-      `Server returned a non-JSON response (${response.status}). ${preview || "No response body."}`
+      `Server returned a non-JSON response (${response.status}). ${preview || "No response body."} Check the Render deploy logs if this continues.`
     );
   }
 }
@@ -441,7 +441,7 @@ async function loadPlayers() {
     $("player").innerHTML = `<option value="">Select a team first</option>`;
     const sourceText = data.source || "WNBA data source";
     $("status").innerHTML = data.warning
-      ? `Loaded ${players.length} player/team records via <strong>${sourceText}</strong>. <span style="color:#ffd166">Fallback mode is active because stats.wnba.com is blocked from this host.</span>`
+      ? `Loaded ${players.length} player/team records via <strong>${sourceText}</strong>. <span style="color:#ffd166">Online fallback mode is active. Player rosters are being loaded through ESPN Core.</span>`
       : `Loaded ${players.length} player/team records from <strong>${sourceText}</strong>.`;
     updateMatchupPreview();
   } catch (e) {
