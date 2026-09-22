@@ -922,6 +922,281 @@ def _made_from_attempt_string(value: Any) -> float:
         return 0.0
 
 
+
+def _https_ref(value: Any) -> str | None:
+    """Normalize ESPN Core $ref URLs to HTTPS."""
+    if not isinstance(value, str) or not value:
+        return None
+    if value.startswith("http://"):
+        return "https://" + value[len("http://"):]
+    if value.startswith("https://"):
+        return value
+    return None
+
+
+def _core_stat_map(payload: dict) -> dict[str, float]:
+    """
+    Flatten ESPN Core player-event statistics into a semantic stat map.
+    Basketball feeds can expose the same stat under slightly different names,
+    so collect name, abbreviation and displayName aliases.
+    """
+    out: dict[str, float] = {}
+
+    def put(key: Any, raw_value: Any):
+        if not key:
+            return
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            # Some display values may be "3-8"; made baskets are handled below.
+            text = str(raw_value or "").strip()
+            if "-" in text:
+                try:
+                    value = float(text.split("-", 1)[0])
+                except ValueError:
+                    return
+            else:
+                return
+        out[str(key).strip().upper()] = value
+
+    splits = payload.get("splits")
+    if isinstance(splits, dict):
+        categories = splits.get("categories") or []
+    else:
+        categories = payload.get("categories") or []
+
+    if isinstance(categories, dict):
+        categories = list(categories.values())
+
+    for category in categories if isinstance(categories, list) else []:
+        if not isinstance(category, dict):
+            continue
+        stats = category.get("stats") or []
+        if isinstance(stats, dict):
+            stats = list(stats.values())
+
+        for stat in stats if isinstance(stats, list) else []:
+            if not isinstance(stat, dict):
+                continue
+            raw = stat.get("value")
+            if raw is None:
+                raw = stat.get("displayValue")
+
+            for key in (
+                stat.get("name"),
+                stat.get("abbreviation"),
+                stat.get("displayName"),
+                stat.get("shortDisplayName"),
+            ):
+                put(key, raw)
+
+    return out
+
+
+def _stat_pick(stat_map: dict[str, float], *aliases: str, default: float = 0.0) -> float:
+    for alias in aliases:
+        key = alias.upper()
+        if key in stat_map:
+            return stat_map[key]
+    return default
+
+
+def _event_short_name(event: dict) -> str:
+    return str(
+        event.get("shortName")
+        or event.get("name")
+        or event.get("displayName")
+        or ""
+    )
+
+
+def _opponent_from_short_name(short_name: str, team_abbr: str) -> str:
+    """
+    Convert ESPN event names such as 'MIN @ IND' / 'MIN vs IND' into opponent
+    abbreviation when possible.
+    """
+    text = (short_name or "").upper().replace("VS.", "VS").replace(" AT ", " @ ")
+    team = team_abbr.upper().strip()
+
+    for token in (" @ ", " VS "):
+        if token in text:
+            left, right = [x.strip() for x in text.split(token, 1)]
+            if left == team:
+                return right
+            if right == team:
+                return left
+
+    # Fall back to any short uppercase token that is not the player's team.
+    tokens = re.findall(r"\b[A-Z]{2,4}\b", text)
+    for token in tokens:
+        if token != team:
+            return token
+    return ""
+
+
+def espn_core_player_logs(
+    espn_player_id: str,
+    season: str,
+    team_abbr: str,
+) -> list[dict]:
+    """
+    Build the WNBA game log entirely from ESPN Core.
+
+    ESPN's Web gamelog endpoint does not consistently expose WNBA events.
+    Core's season athlete eventlog is more stable and includes per-game refs:
+      /seasons/{year}/athletes/{id}/eventlog
+
+    Each eventlog item points to the event document and that player's game
+    statistics document. We resolve those refs concurrently and normalize them
+    into GAME_DATE / MATCHUP / MIN / PTS / REB / AST / FG3M.
+    """
+    cache_key = f"espn-core-gamelog:{season}:{espn_player_id}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    eventlog_url = (
+        f"{ESPN_CORE_V2_BASE}/seasons/{season}/athletes/"
+        f"{espn_player_id}/eventlog"
+    )
+    eventlog = espn_core_get(eventlog_url, {"limit": 100}, timeout=10)
+
+    events_block = eventlog.get("events") or {}
+    if isinstance(events_block, dict):
+        items = events_block.get("items") or []
+    elif isinstance(events_block, list):
+        items = events_block
+    else:
+        items = []
+
+    if not items:
+        raise RuntimeError(
+            "ESPN Core eventlog did not contain any games for this player/season."
+        )
+
+    jobs = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("played") is False:
+            continue
+
+        event_ref = None
+        stats_ref = None
+
+        event_obj = item.get("event")
+        if isinstance(event_obj, dict):
+            event_ref = _https_ref(event_obj.get("$ref"))
+
+        stats_obj = item.get("statistics")
+        if isinstance(stats_obj, dict):
+            stats_ref = _https_ref(stats_obj.get("$ref"))
+
+        if event_ref and stats_ref:
+            jobs.append(
+                {
+                    "event_ref": event_ref,
+                    "stats_ref": stats_ref,
+                    "team_id": str(item.get("teamId", "")),
+                }
+            )
+
+    if not jobs:
+        raise RuntimeError(
+            "ESPN Core eventlog returned games, but no usable event/statistics references."
+        )
+
+    # Fetch all unique refs concurrently. A full WNBA season is small enough
+    # that this remains quick while avoiding the unsupported Web gamelog.
+    refs = set()
+    for job in jobs:
+        refs.add(job["event_ref"])
+        refs.add(job["stats_ref"])
+
+    docs: dict[str, dict] = {}
+    errors = []
+
+    def fetch_ref(ref: str):
+        try:
+            return ref, espn_core_get(ref, timeout=8), None
+        except Exception as exc:
+            return ref, None, str(exc)
+
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        futures = [executor.submit(fetch_ref, ref) for ref in refs]
+        for future in as_completed(futures):
+            ref, payload, error = future.result()
+            if payload is not None:
+                docs[ref] = payload
+            elif error:
+                errors.append(error)
+
+    rows = []
+    for job in jobs:
+        event = docs.get(job["event_ref"])
+        stats_payload = docs.get(job["stats_ref"])
+        if not isinstance(event, dict) or not isinstance(stats_payload, dict):
+            continue
+
+        date = event.get("date")
+        short_name = _event_short_name(event)
+        opponent = _opponent_from_short_name(short_name, team_abbr)
+
+        # Keep MATCHUP compatible with the existing H2H matcher.
+        matchup = short_name
+        if opponent and team_abbr.upper() not in matchup.upper():
+            matchup = f"{team_abbr.upper()} vs. {opponent}"
+
+        stat_map = _core_stat_map(stats_payload)
+
+        row = {
+            "GAME_DATE": date,
+            "MATCHUP": matchup,
+            "MIN": _stat_pick(
+                stat_map,
+                "MIN",
+                "MINUTES",
+                "MINUTESPLAYED",
+            ),
+            "PTS": _stat_pick(
+                stat_map,
+                "PTS",
+                "POINTS",
+            ),
+            "REB": _stat_pick(
+                stat_map,
+                "REB",
+                "REBOUNDS",
+                "TOTALREBOUNDS",
+            ),
+            "AST": _stat_pick(
+                stat_map,
+                "AST",
+                "ASSISTS",
+            ),
+            "FG3M": _stat_pick(
+                stat_map,
+                "3PM",
+                "FG3M",
+                "THREEPOINTFIELDGOALSMADE",
+                "THREEPOINTSMADE",
+            ),
+        }
+        rows.append(row)
+
+    rows.sort(
+        key=lambda r: parse_game_date(r.get("GAME_DATE")) or datetime.min,
+        reverse=True,
+    )
+
+    if not rows:
+        detail = errors[0] if errors else "No resolved event/stat rows."
+        raise RuntimeError(f"ESPN Core could not build the player game log. {detail}")
+
+    _cache_set(cache_key, rows)
+    return rows
+
+
 def espn_player_logs(espn_player_id: str, season: str, team_abbr: str) -> list[dict]:
     """
     Normalize ESPN's athlete gamelog into the same fields used by the WNBA
@@ -1278,7 +1553,11 @@ def api_analyze():
                 raise RuntimeError("Selected ESPN Core player could not be found.")
 
             provider_id = player_id.split(":", 1)[1]
-            logs = espn_player_logs(provider_id, season, player.get("team", ""))
+            logs = espn_core_player_logs(
+                provider_id,
+                season,
+                player.get("team", ""),
+            )
             analysis = analyze_prop(logs, stat, line, opponent)
             season_average, season_minutes = averages_from_logs(logs, stat)
 
@@ -1290,10 +1569,10 @@ def api_analyze():
                     "leader_context": None,
                     "leader_error": "WNBA Leaders cross-check unavailable while using fallback mode.",
                     "analysis": analysis,
-                    "source": "ESPN Core roster + ESPN Web game logs (online fallback mode)",
+                    "source": "ESPN Core roster + ESPN Core event logs (online fallback mode)",
                     "note": (
                         "The hosting server could not reliably reach stats.wnba.com, so this "
-                        "analysis used ESPN Core for the WNBA roster and ESPN Web for player game logs. "
+                        "analysis used ESPN Core for both the WNBA roster and player event/game statistics. "
                         "The same strict August/September L10, L5 and current-season "
                         "H2H rules were applied. Injury/availability is still separate."
                     ),

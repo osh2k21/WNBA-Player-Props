@@ -166,3 +166,26 @@ v9:
 - Caches team abbreviation, team ID and logo.
 - Attaches the resolved team to every athlete.
 - Falls back to individual athlete profiles only for unresolved edge cases.
+
+
+## v10 Core event-log fix
+
+The ESPN Web athlete gamelog endpoint can return no `events` list for WNBA
+players even when the player roster is available. v10 removes that dependency
+from online analysis.
+
+Hosted analysis now uses ESPN Core's documented athlete event-log pattern:
+
+`/v2/sports/basketball/leagues/wnba/seasons/{YEAR}/athletes/{ATHLETE_ID}/eventlog`
+
+The eventlog provides an event `$ref` and a player statistics `$ref` for each
+game. v10 resolves those references concurrently and normalizes:
+- game date
+- matchup/opponent
+- minutes
+- points
+- rebounds
+- assists
+- made threes
+
+Local mode continues to prefer official WNBA Stats.
