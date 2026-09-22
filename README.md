@@ -148,3 +148,21 @@ Online source path:
 ESPN Core v3 athletes is attempted first, then Core v2 as a backup. The parser
 accepts several athlete/team schema variants and falls back to individual Core
 athlete profiles when team metadata is missing from the collection response.
+
+
+## v9 ESPN Core team-reference fix
+
+ESPN Core's athlete directory often does not embed the team abbreviation. Instead,
+an athlete can contain a team object shaped like:
+
+`{"team": {"$ref": "https://sports.core.api.espn.com/.../teams/{id}"}}`
+
+v8 expected embedded team metadata, so it could see the athletes but discard them
+because the team abbreviation was empty.
+
+v9:
+- Detects those team `$ref` URLs.
+- Resolves only the unique team references (not one team request per athlete).
+- Caches team abbreviation, team ID and logo.
+- Attaches the resolved team to every athlete.
+- Falls back to individual athlete profiles only for unresolved edge cases.

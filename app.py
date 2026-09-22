@@ -470,6 +470,60 @@ def _extract_headshot(athlete: dict) -> str | None:
     return None
 
 
+def _extract_team_ref(athlete: dict) -> str | None:
+    """
+    ESPN Core often returns athlete.team as {"$ref": ".../teams/{id}"} rather
+    than embedding the team object. Return that reference so we can resolve the
+    small set of unique WNBA teams once and reuse them for every athlete.
+    """
+    candidate = athlete.get("team")
+    if isinstance(candidate, dict):
+        ref = candidate.get("$ref")
+        if isinstance(ref, str) and ref.startswith("http"):
+            return ref
+
+    teams = athlete.get("teams")
+    if isinstance(teams, list):
+        for item in teams:
+            if isinstance(item, dict):
+                ref = item.get("$ref")
+                if isinstance(ref, str) and ref.startswith("http"):
+                    return ref
+
+    return None
+
+
+def _normalize_core_team(team: dict) -> dict:
+    """
+    Normalize an ESPN Core team document into the fields used by the UI.
+    """
+    team_id = str(_first_nonempty(team, "id", "teamId") or "")
+    abbr = str(
+        _first_nonempty(
+            team,
+            "abbreviation",
+            "abbr",
+            "shortDisplayName",
+        )
+        or ""
+    ).upper()
+
+    logo_url = None
+    logos = team.get("logos")
+    if isinstance(logos, list) and logos:
+        first_logo = logos[0]
+        if isinstance(first_logo, dict):
+            logo_url = first_logo.get("href")
+    elif isinstance(team.get("logo"), str):
+        logo_url = team.get("logo")
+
+    return {
+        "team_id": team_id,
+        "team": abbr,
+        "team_logo": logo_url,
+    }
+
+
 def _normalize_core_athlete(athlete: dict) -> dict | None:
     athlete_id = str(_first_nonempty(athlete, "id", "athleteId") or "")
     if not athlete_id:
@@ -513,9 +567,10 @@ def espn_core_players(season: str) -> list[dict]:
     """
     Load active WNBA athletes from ESPN Core API.
 
-    v3 is attempted first because it returns the richer athlete schema. If v3
-    returns an unexpected collection shape, v2 is attempted as a secondary Core
-    endpoint. The app does not call site.api.espn.com for the Render roster.
+    ESPN Core athlete collections frequently provide the current team as a
+    `$ref` URL instead of embedding abbreviation/team metadata. We resolve the
+    unique team references (normally only ~15-18 WNBA teams), cache them, and
+    attach that team metadata to every athlete.
     """
     cache_key = f"espn-core-players:{season}"
     cached = _cache_get(cache_key)
@@ -552,44 +607,107 @@ def espn_core_players(season: str) -> list[dict]:
             "ESPN Core athlete directory failed. " + " | ".join(errors[:2])
         )
 
-    players = []
-    missing_team = []
+    raw_athletes = _extract_core_items(payload)
 
-    for athlete in _extract_core_items(payload):
+    # First pass: normalize what is embedded and collect unresolved team refs.
+    pending = []
+    team_refs = set()
+    ready = []
+
+    for athlete in raw_athletes:
         normalized = _normalize_core_athlete(athlete)
         if not normalized:
             continue
-        if normalized["team"]:
-            players.append(normalized)
-        else:
-            missing_team.append((normalized, athlete))
 
-    # If the enriched list omitted team metadata for a small number of athletes,
-    # try the individual Core v3 athlete profile concurrently.
-    if missing_team:
+        if normalized.get("team"):
+            ready.append(normalized)
+            continue
+
+        team_ref = _extract_team_ref(athlete)
+        pending.append((normalized, athlete, team_ref))
+        if team_ref:
+            team_refs.add(team_ref)
+
+    # Resolve each unique team ref only once.
+    team_cache = {}
+
+    def fetch_team_ref(ref: str):
+        try:
+            payload = espn_core_get(ref, timeout=7)
+            return ref, _normalize_core_team(payload), None
+        except Exception as exc:
+            return ref, None, str(exc)
+
+    if team_refs:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(fetch_team_ref, ref) for ref in team_refs]
+            for future in as_completed(futures):
+                ref, team_data, error = future.result()
+                if team_data and team_data.get("team"):
+                    team_cache[ref] = team_data
+                elif error:
+                    errors.append(f"team-ref {ref}: {error}")
+
+    # Attach resolved team metadata.
+    still_missing = []
+    for normalized, raw, team_ref in pending:
+        team_data = team_cache.get(team_ref) if team_ref else None
+        if team_data:
+            normalized["team_id"] = team_data.get("team_id", "")
+            normalized["team"] = team_data.get("team", "")
+            normalized["team_logo"] = team_data.get("team_logo")
+            ready.append(normalized)
+        else:
+            still_missing.append((normalized, raw))
+
+    # Last resort: fetch individual athlete profiles. Those profiles usually
+    # carry a resolvable team $ref even when the collection response is sparse.
+    if still_missing:
         def fetch_profile(entry):
             normalized, _raw = entry
             athlete_id = normalized["provider_player_id"]
-            try:
-                profile = espn_core_get(
-                    f"{ESPN_CORE_V3_BASE}/athletes/{athlete_id}",
-                    timeout=7,
-                )
-                upgraded = _normalize_core_athlete(profile)
-                return upgraded or normalized
-            except Exception:
-                return normalized
+            for base in (ESPN_CORE_V3_BASE, ESPN_CORE_V2_BASE):
+                try:
+                    profile = espn_core_get(
+                        f"{base}/athletes/{athlete_id}",
+                        timeout=7,
+                    )
+
+                    upgraded = _normalize_core_athlete(profile) or normalized
+                    if upgraded.get("team"):
+                        return upgraded
+
+                    ref = _extract_team_ref(profile)
+                    if ref:
+                        if ref in team_cache:
+                            team_data = team_cache[ref]
+                        else:
+                            team_doc = espn_core_get(ref, timeout=7)
+                            team_data = _normalize_core_team(team_doc)
+                            if team_data.get("team"):
+                                team_cache[ref] = team_data
+
+                        if team_data and team_data.get("team"):
+                            upgraded["team_id"] = team_data.get("team_id", "")
+                            upgraded["team"] = team_data.get("team", "")
+                            upgraded["team_logo"] = team_data.get("team_logo")
+                            return upgraded
+                except Exception:
+                    continue
+            return normalized
 
         with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(fetch_profile, entry) for entry in missing_team]
+            futures = [executor.submit(fetch_profile, entry) for entry in still_missing]
             for future in as_completed(futures):
                 player = future.result()
                 if player.get("team"):
-                    players.append(player)
+                    ready.append(player)
 
-    # Deduplicate and ignore athletes that still have no current WNBA team.
+    # Deduplicate by athlete/team and ignore free agents / unresolved entries.
     deduped = {}
-    for p in players:
+    for p in ready:
+        if not p.get("team"):
+            continue
         key = (p["provider_player_id"], p["team"])
         deduped[key] = p
 
@@ -597,8 +715,11 @@ def espn_core_players(season: str) -> list[dict]:
     players.sort(key=lambda x: (x["team"], x["player_name"]))
 
     if not players:
+        diagnostic_refs = len(team_refs)
         raise RuntimeError(
-            "ESPN Core returned athletes, but none included usable current WNBA team data."
+            "ESPN Core returned athletes, but team references could not be resolved "
+            f"into current WNBA teams. Found {len(raw_athletes)} athletes and "
+            f"{diagnostic_refs} unique team references."
         )
 
     _cache_set(cache_key, players)
