@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
@@ -81,20 +82,20 @@ def parse_game_date(value):
     return None
 
 
-def stats_get(endpoint: str, params: dict[str, Any], timeout: int = 20) -> dict:
+def stats_get(endpoint: str, params: dict[str, Any], timeout: int = 8) -> dict:
     """GET JSON from stats.wnba.com with a small retry loop."""
     url = f"{WNBA_STATS_BASE}/{endpoint}"
     last_error = None
 
-    for attempt in range(3):
+    for attempt in range(2):
         try:
             response = SESSION.get(url, params=params, timeout=timeout)
             response.raise_for_status()
             return response.json()
         except Exception as exc:
             last_error = exc
-            if attempt < 2:
-                time.sleep(0.8 * (attempt + 1))
+            if attempt < 1:
+                time.sleep(0.5)
 
     raise RuntimeError(f"Official WNBA Stats request failed: {last_error}")
 
@@ -302,8 +303,8 @@ def player_logs(player_id: str, season: str) -> list[dict]:
 
 
 
-def espn_get(url: str, params: dict[str, Any] | None = None, timeout: int = 20) -> dict:
-    """Fetch JSON from ESPN's public web data endpoints."""
+def espn_get(url: str, params: dict[str, Any] | None = None, timeout: int = 8) -> dict:
+    """Fetch JSON from ESPN's public web data endpoints with short cloud-safe timeouts."""
     headers = {
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
@@ -311,22 +312,26 @@ def espn_get(url: str, params: dict[str, Any] | None = None, timeout: int = 20) 
         "Referer": "https://www.espn.com/",
     }
     last_error = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            response = requests.get(url, params=params or {}, headers=headers, timeout=timeout)
+            response = requests.get(
+                url,
+                params=params or {},
+                headers=headers,
+                timeout=timeout,
+            )
             response.raise_for_status()
-            content_type = response.headers.get("content-type", "")
-            if "json" not in content_type.lower():
-                # Some upstreams omit the JSON content type, so still try JSON,
-                # but emit a useful error when an HTML challenge page is returned.
-                text = response.text.lstrip()
-                if text.startswith("<"):
-                    raise RuntimeError("ESPN returned HTML instead of JSON.")
+            text = response.text.lstrip()
+            if text.startswith("<"):
+                raise RuntimeError(
+                    f"ESPN returned HTML instead of JSON (HTTP {response.status_code})."
+                )
             return response.json()
         except Exception as exc:
             last_error = exc
-            if attempt < 2:
-                time.sleep(0.6 * (attempt + 1))
+            if attempt == 0:
+                time.sleep(0.35)
+
     raise RuntimeError(f"ESPN fallback request failed: {last_error}")
 
 
@@ -370,22 +375,21 @@ def espn_league_players(season: str) -> list[dict]:
     """
     Render-safe player-list fallback.
 
-    stats.wnba.com sometimes blocks cloud/datacenter IPs. ESPN's team + roster
-    endpoints are used only when the official WNBA Stats request cannot be used.
+    ESPN's team endpoint supplies the WNBA team list. Team rosters are fetched
+    concurrently so a cold Render instance does not spend 30+ seconds loading
+    rosters one at a time.
     """
     cache_key = f"espn-players:{season}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    teams_payload = espn_get(f"{ESPN_SITE_BASE}/teams", {"limit": 100})
+    teams_payload = espn_get(f"{ESPN_SITE_BASE}/teams", {"limit": 100}, timeout=8)
     team_entries = _espn_team_entries(teams_payload)
     if not team_entries:
         raise RuntimeError("ESPN returned no WNBA teams.")
 
-    players = []
-    seen = set()
-
+    normalized_teams = []
     for team in team_entries:
         team_id = str(team.get("id", ""))
         abbr = str(team.get("abbreviation", "")).upper()
@@ -397,16 +401,47 @@ def espn_league_players(season: str) -> list[dict]:
         if isinstance(logos, list) and logos:
             logo_url = logos[0].get("href")
 
-        try:
-            roster = espn_get(f"{ESPN_SITE_BASE}/teams/{team_id}/roster")
-        except Exception:
-            continue
+        normalized_teams.append(
+            {
+                "team_id": team_id,
+                "abbr": abbr,
+                "logo_url": logo_url,
+            }
+        )
 
+    if not normalized_teams:
+        raise RuntimeError("ESPN team list was present but contained no usable teams.")
+
+    def fetch_roster(team_info: dict) -> tuple[dict, dict | None, str | None]:
+        url = f"{ESPN_SITE_BASE}/teams/{team_info['team_id']}/roster"
+        try:
+            return team_info, espn_get(url, timeout=7), None
+        except Exception as exc:
+            return team_info, None, str(exc)
+
+    roster_results = []
+    errors = []
+
+    # A small pool is faster than sequential requests without hammering ESPN.
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [executor.submit(fetch_roster, t) for t in normalized_teams]
+        for future in as_completed(futures):
+            team_info, roster, error = future.result()
+            if roster is not None:
+                roster_results.append((team_info, roster))
+            elif error:
+                errors.append(f"{team_info['abbr']}: {error}")
+
+    players = []
+    seen = set()
+
+    for team_info, roster in roster_results:
         for athlete in _flatten_roster_athletes(roster):
             espn_id = str(athlete.get("id", ""))
             if not espn_id:
                 continue
-            key = (espn_id, team_id)
+
+            key = (espn_id, team_info["team_id"])
             if key in seen:
                 continue
             seen.add(key)
@@ -416,14 +451,16 @@ def espn_league_players(season: str) -> list[dict]:
 
             players.append(
                 {
-                    # Prefix prevents an ESPN ID from being mistaken for a WNBA Stats ID.
                     "player_id": f"espn:{espn_id}",
                     "provider_player_id": espn_id,
                     "provider": "espn",
-                    "player_name": athlete.get("fullName") or athlete.get("displayName") or "",
-                    "team_id": team_id,
-                    "team": abbr,
-                    "team_logo": logo_url,
+                    "player_name": athlete.get("fullName")
+                    or athlete.get("displayName")
+                    or athlete.get("shortName")
+                    or "",
+                    "team_id": team_info["team_id"],
+                    "team": team_info["abbr"],
+                    "team_logo": team_info["logo_url"],
                     "photo_url": photo_url,
                     "season_pts": None,
                     "season_reb": None,
@@ -435,7 +472,11 @@ def espn_league_players(season: str) -> list[dict]:
             )
 
     if not players:
-        raise RuntimeError("ESPN fallback returned no WNBA roster players.")
+        detail = "; ".join(errors[:4])
+        raise RuntimeError(
+            "ESPN fallback returned no WNBA roster players."
+            + (f" Roster errors: {detail}" if detail else "")
+        )
 
     players.sort(key=lambda x: (x["team"], x["player_name"]))
     _cache_set(cache_key, players)
@@ -444,9 +485,22 @@ def espn_league_players(season: str) -> list[dict]:
 
 def players_with_fallback(season: str) -> tuple[list[dict], str, str | None]:
     """
-    Prefer official WNBA Stats. If the cloud host is blocked/challenged,
-    automatically fall back to ESPN for team rosters and player identifiers.
+    Prefer official WNBA Stats on normal/local networks.
+
+    Render cloud IPs are frequently challenged by stats.wnba.com. On Render we
+    go directly to the ESPN fallback instead of waiting for the official request
+    to time out and causing a Gunicorn 500/worker timeout.
     """
+    on_render = bool(os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID"))
+
+    if on_render:
+        fallback = espn_league_players(season)
+        return (
+            fallback,
+            "ESPN fallback",
+            "Online fallback mode is active because stats.wnba.com can block Render cloud requests.",
+        )
+
     try:
         official = league_players(season)
         if official:
@@ -462,7 +516,7 @@ def players_with_fallback(season: str) -> tuple[list[dict], str, str | None]:
         return (
             fallback,
             "ESPN fallback",
-            f"Official WNBA Stats was unavailable from this server, so the app switched to ESPN. {exc}",
+            f"Official WNBA Stats was unavailable, so the app switched to ESPN. {exc}",
         )
 
 
@@ -759,6 +813,21 @@ def api_player_image(player_id: str):
 
     # Returning 404 intentionally triggers the initials fallback in the browser.
     return Response(status=404)
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(exc):
+    # Keep API failures machine-readable. This prevents the browser from seeing
+    # Render/Flask's HTML "Internal Server Error" page and producing JSON errors.
+    if request.path.startswith("/api/"):
+        app.logger.exception("API error: %s", exc)
+        return jsonify(
+            {
+                "error": f"Server error: {type(exc).__name__}: {exc}",
+            }
+        ), 500
+
+    raise exc
 
 
 @app.route("/")

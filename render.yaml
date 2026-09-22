@@ -3,5 +3,5 @@ services:
     name: wnba-player-props
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers 2 --threads 4 --timeout 90
+    startCommand: gunicorn app:app --workers 2 --threads 4 --timeout 120
     autoDeploy: true

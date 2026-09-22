@@ -118,3 +118,18 @@ v6 now:
 
 The official WNBA Stats source remains the primary source whenever the host can
 reach it.
+
+
+## v7 Render 500 fix
+
+v6 could still hit Render's Gunicorn timeout because the app first waited on a
+blocked stats.wnba.com request and then fetched ESPN team rosters sequentially.
+
+v7 changes the online startup path:
+
+- Detects Render and goes straight to the ESPN fallback for the player dropdown.
+- Fetches ESPN team rosters concurrently instead of one at a time.
+- Uses shorter upstream timeouts/retries.
+- Returns JSON for unexpected `/api/*` errors instead of an HTML 500 page.
+- Raises the Render Gunicorn timeout to 120 seconds as an extra safety margin.
+- Local use still prefers official WNBA Stats first.
